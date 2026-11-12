@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include "stm32u3xx_ll_tim.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -178,66 +180,35 @@ int main(void)
   MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
 
-  TIM_OC_InitTypeDef phaseConfig = {0};
 
-  const uint32_t channels[4] = {
-      TIM_CHANNEL_1, TIM_CHANNEL_2,
-      TIM_CHANNEL_3, TIM_CHANNEL_4
-  };
-
-  const uint32_t compareValues[4] = {
-      125, 375, 375, 125
-  };
-
-  phaseConfig.OCMode = TIM_OCMODE_ASYMMETRIC_PWM2;
-  phaseConfig.OCPolarity = TIM_OCPOLARITY_HIGH;
-  phaseConfig.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  phaseConfig.OCFastMode = TIM_OCFAST_DISABLE;
-  phaseConfig.OCIdleState = TIM_OCIDLESTATE_RESET;
-  phaseConfig.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-
-  for (uint32_t i = 0; i < 4; i++)
+  /* Load the configured timing values once, before starting. */
+  if (HAL_TIM_GenerateEvent(&htim1,
+                          TIM_EVENTSOURCE_UPDATE) != HAL_OK)
   {
-      phaseConfig.Pulse = compareValues[i];
-
-      if (HAL_TIM_PWM_ConfigChannel(
-              &htim1, &phaseConfig, channels[i]) != HAL_OK)
-      {
-          Error_Handler();
-      }
+      Error_Handler();
   }
 
-  /* Stop after 1000 complete up/down periods. */
-  SET_BIT(htim1.Instance->CR1, TIM_CR1_OPM);
+  /* Start CH1. */
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+  {
+      Error_Handler();
+  }
 
-  /* Load all timing values before starting. */
-  htim1.Instance->EGR = TIM_EGR_UG;
-  __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+  /* Start CH3 on the same timer counter. */
+  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
+  {
+      Error_Handler();
+  }
 
-  /* Enable A and B together, then start their shared counter. */
-  SET_BIT(htim1.Instance->CCER,
-          TIM_CCER_CC1E | TIM_CCER_CC3E);
+  // /* Keep the outputs enabled, but hold both LOW. */
+  // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH1,
+  //                 LL_TIM_OCMODE_FORCED_INACTIVE);
 
-  __HAL_TIM_MOE_ENABLE(&htim1);
-  __HAL_TIM_ENABLE(&htim1);
-
-
-
-
-
-  //////////////////////////////////////////////////////////
-
-
-  // SET_BIT(htim1.Instance->CR1, TIM_CR1_OPM);
-
-  // htim1.Instance->EGR = TIM_EGR_UG;
-  // __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+  // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH3,
+  //                 LL_TIM_OCMODE_FORCED_INACTIVE);
 
 
-  // if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
-  // {
-  //     Error_Handler();
-  // }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -247,19 +218,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    while ((htim1.Instance->CR1 & TIM_CR1_CEN) != 0U)
-    {
-    }
 
-    /* Keep the output LOW for 10 seconds. */
-    HAL_Delay(10000);
+    // HAL_Delay(5000);
 
-    /* Reload the counter for the next 500-pulse burst. */
-    htim1.Instance->EGR = TIM_EGR_UG;
-    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
 
-    /* Restart the counter; the PWM channel remains enabled. */
-    __HAL_TIM_ENABLE(&htim1);
   }
 
   /* USER CODE END 3 */
@@ -1430,8 +1392,8 @@ static void MX_TIM1_Init(void)
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED3;
   htim1.Init.Period = 500;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 1999;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
   {
     Error_Handler();
@@ -1467,21 +1429,19 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  __HAL_TIM_DISABLE_OCxPRELOAD(&htim1, TIM_CHANNEL_1);
   sConfigOC.OCMode = TIM_OCMODE_TIMING;
   sConfigOC.Pulse = 375;
   if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_ASSYMETRIC_PWM2;
+  sConfigOC.OCMode = TIM_OCMODE_ASSYMETRIC_PWM1;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
-  __HAL_TIM_DISABLE_OCxPRELOAD(&htim1, TIM_CHANNEL_3);
   sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 25;
+  sConfigOC.Pulse = 125;
   if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
@@ -1504,6 +1464,10 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* Internal references used by asymmetric CH1 and CH3. */
+  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
+  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH4, LL_TIM_OCMODE_PWM1);
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);

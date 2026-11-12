@@ -9,3 +9,4 @@
 - Provide all proposed code, file paths, and insertion/replacement guidance in the chat for user review.
 - The user will make code changes manually after review.
 provide the proposed code, exact target file, and insertion/replacement instructions in chat. The user alone applies changes to files.
+- follow the code standards with these principles DRY(dont repeat yourself) and KISS (keep it simple stupid).
