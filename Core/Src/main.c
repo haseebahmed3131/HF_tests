@@ -79,6 +79,8 @@ TIM_HandleTypeDef htim8;
 
 /* USER CODE BEGIN PV */
 
+static uint32_t ch1n_pulse_count;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -194,18 +196,55 @@ int main(void)
       Error_Handler();
   }
 
-  /* Start CH3 on the same timer counter. */
-  if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
+  // /* Start CH3 on the same timer counter. */
+  // if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
+  // {
+  //     Error_Handler();
+  // }
+
+
+  /* Start CH1N on PE8. */
+  if (HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
   {
       Error_Handler();
   }
 
-  // /* Keep the outputs enabled, but hold both LOW. */
-  // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH1,
-  //                 LL_TIM_OCMODE_FORCED_INACTIVE);
 
-  // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH3,
-  //                 LL_TIM_OCMODE_FORCED_INACTIVE);
+
+
+
+  // // /* Keep the outputs enabled, but hold both LOW. */
+  // // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH1,
+  // //                 LL_TIM_OCMODE_FORCED_INACTIVE);
+
+  // // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH3,
+  // //                 LL_TIM_OCMODE_FORCED_INACTIVE);
+
+
+
+
+
+
+  // ch1n_pulse_count = 0U;
+
+  // /* Load timing values before starting. */
+  // if (HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
+  // {
+  //     Error_Handler();
+  // }
+
+  // /* Exclude the software-generated update. */
+  // __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+
+  // /* Enable both outputs, then start their shared counter. */
+  // LL_TIM_CC_EnableChannel(TIM1,
+  //                         LL_TIM_CHANNEL_CH1 | LL_TIM_CHANNEL_CH1N);
+  // LL_TIM_EnableAllOutputs(TIM1);
+
+  // __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+  // LL_TIM_EnableCounter(TIM1);
+
+
 
 
 
@@ -1389,8 +1428,8 @@ static void MX_TIM1_Init(void)
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 23;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED3;
-  htim1.Init.Period = 500;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 999;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
@@ -1407,10 +1446,6 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
@@ -1418,31 +1453,14 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sConfigOC.OCMode = TIM_OCMODE_ASSYMETRIC_PWM1;
-  sConfigOC.Pulse = 125;
+  sConfigOC.OCMode = TIM_OCMODE_PWM2;
+  sConfigOC.Pulse = 500;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 375;
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_ASSYMETRIC_PWM1;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_TIMING;
-  sConfigOC.Pulse = 125;
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1465,9 +1483,9 @@ static void MX_TIM1_Init(void)
   }
   /* USER CODE BEGIN TIM1_Init 2 */
 
-  /* Internal references used by asymmetric CH1 and CH3. */
-  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
-  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH4, LL_TIM_OCMODE_PWM1);
+  // /* Internal references used by asymmetric CH1 and CH3. */
+  // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH2, LL_TIM_OCMODE_PWM1);
+  // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH4, LL_TIM_OCMODE_PWM1);
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
@@ -1760,6 +1778,33 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+// void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+// {
+//     if (htim->Instance != TIM1)
+//     {
+//         return;
+//     }
+
+//     ch1n_pulse_count++;
+
+//     if (ch1n_pulse_count == 20U)
+//     {
+//         GPIO_InitTypeDef gpio = {0};
+
+//         /* Stop counting; leave TIM1 and CH1 running. */
+//         __HAL_TIM_DISABLE_IT(htim, TIM_IT_UPDATE);
+
+//         /* Prepare HIGH before handing PE8 over to GPIO. */
+//         HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_SET);
+
+//         gpio.Pin = GPIO_PIN_8;
+//         gpio.Mode = GPIO_MODE_OUTPUT_PP;
+//         gpio.Pull = GPIO_NOPULL;
+//         gpio.Speed = GPIO_SPEED_FREQ_LOW;
+//         HAL_GPIO_Init(GPIOE, &gpio);
+//     }
+// }
 
 /* USER CODE END 4 */
 
