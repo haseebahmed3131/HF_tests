@@ -76,16 +76,18 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim8;
+DMA_HandleTypeDef handle_GPDMA1_Channel0;
 
 /* USER CODE BEGIN PV */
 
-static uint32_t ch1n_pulse_count;
+static uint32_t tim1_fault_ccer;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_GPDMA1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_I2C3_Init(void);
@@ -112,8 +114,8 @@ static void MX_LPTIM4_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
-static void MX_TIM8_Init(void);
 static void MX_TIM4_Init(void);
+static void MX_TIM8_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -152,6 +154,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_GPDMA1_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_I2C3_Init();
@@ -178,74 +181,54 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
-  MX_TIM8_Init();
   MX_TIM4_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
+  /* No CPU update callback is needed. */
+  __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+  __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
 
-  // /* Load the configured timing values once, before starting. */
-  // if (HAL_TIM_GenerateEvent(&htim1,
-  //                         TIM_EVENTSOURCE_UPDATE) != HAL_OK)
-  // {
-  //     Error_Handler();
-  // }
+  /* Apply DMA-written channel controls immediately. */
+  LL_TIM_CC_DisablePreload(TIM1);
 
-  // /* Start CH1. */
-  // if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
-  // {
-  //     Error_Handler();
-  // }
-
-  // // /* Start CH3 on the same timer counter. */
-  // // if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3) != HAL_OK)
-  // // {
-  // //     Error_Handler();
-  // // }
-
-
-  // /* Start CH1N on PE8. */
-  // if (HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
-  // {
-  //     Error_Handler();
-  // }
-
-
-
-
-
-  // // /* Keep the outputs enabled, but hold both LOW. */
-  // // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH1,
-  // //                 LL_TIM_OCMODE_FORCED_INACTIVE);
-
-  // // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH3,
-  // //                 LL_TIM_OCMODE_FORCED_INACTIVE);
-
-
-
-
-
-
-  ch1n_pulse_count = 0U;
-
-  /* Load timing values before starting. */
+  /* Load timing and repetition values before arming DMA. */
   if (HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
   {
       Error_Handler();
   }
-
-  /* Exclude the software-generated update. */
   __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
 
-  /* Enable both outputs, then start their shared counter. */
+  /* Enable normal complementary PWM. */
   LL_TIM_CC_EnableChannel(TIM1,
                           LL_TIM_CHANNEL_CH1 | LL_TIM_CHANNEL_CH1N);
+
+  /* Preserve CH1; disable CH1N with its off-state HIGH. */
+  tim1_fault_ccer = (TIM1->CCER
+                    & ~(TIM_CCER_CC1NE | TIM_CCER_CC1NP))
+                  | TIM_CCER_CC1NP;
+
+  if (htim1.hdma[TIM_DMA_ID_UPDATE] == NULL)
+  {
+      Error_Handler();
+  }
+
+  __DSB();
+
+  /* Arm one 32-bit transfer. Size is specified in bytes. */
+  if (HAL_DMA_Start(htim1.hdma[TIM_DMA_ID_UPDATE],
+                    (uint32_t)&tim1_fault_ccer,
+                    (uint32_t)&TIM1->CCER,
+                    sizeof(tim1_fault_ccer)) != HAL_OK)
+  {
+      Error_Handler();
+  }
+
+  /* Request the transfer after 700 periods. */
+  __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
+
   LL_TIM_EnableAllOutputs(TIM1);
-
-  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
   LL_TIM_EnableCounter(TIM1);
-
-
-
 
 
   /* USER CODE END 2 */
@@ -390,6 +373,34 @@ static void MX_COMP2_Init(void)
   /* USER CODE BEGIN COMP2_Init 2 */
 
   /* USER CODE END COMP2_Init 2 */
+
+}
+
+/**
+  * @brief GPDMA1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPDMA1_Init(void)
+{
+
+  /* USER CODE BEGIN GPDMA1_Init 0 */
+
+  /* USER CODE END GPDMA1_Init 0 */
+
+  /* Peripheral clock enable */
+  __HAL_RCC_GPDMA1_CLK_ENABLE();
+
+  /* GPDMA1 interrupt Init */
+    HAL_NVIC_SetPriority(GPDMA1_Channel0_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(GPDMA1_Channel0_IRQn);
+
+  /* USER CODE BEGIN GPDMA1_Init 1 */
+
+  /* USER CODE END GPDMA1_Init 1 */
+  /* USER CODE BEGIN GPDMA1_Init 2 */
+
+  /* USER CODE END GPDMA1_Init 2 */
 
 }
 
@@ -1431,7 +1442,7 @@ static void MX_TIM1_Init(void)
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim1.Init.Period = 999;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.RepetitionCounter = 3499;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
   {
@@ -1464,7 +1475,7 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_ENABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
   sBreakDeadTimeConfig.DeadTime = 0;
@@ -1779,32 +1790,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance != TIM1)
-    {
-        return;
-    }
 
-    ch1n_pulse_count++;
-
-    if (ch1n_pulse_count == 700U)
-    {
-        GPIO_InitTypeDef gpio = {0};
-
-        /* Stop counting; leave TIM1 and CH1 running. */
-        __HAL_TIM_DISABLE_IT(htim, TIM_IT_UPDATE);
-
-        /* Prepare HIGH before handing PE8 over to GPIO. */
-        HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, GPIO_PIN_SET);
-
-        gpio.Pin = GPIO_PIN_8;
-        gpio.Mode = GPIO_MODE_OUTPUT_PP;
-        gpio.Pull = GPIO_NOPULL;
-        gpio.Speed = GPIO_SPEED_FREQ_LOW;
-        HAL_GPIO_Init(GPIOE, &gpio);
-    }
-}
 
 /* USER CODE END 4 */
 
