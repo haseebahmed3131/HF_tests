@@ -81,6 +81,7 @@ TIM_HandleTypeDef htim8;
 /* USER CODE BEGIN PV */
 
 static uint32_t encoder_report_tick;
+static uint8_t reverse_started;
 
 /* USER CODE END PV */
 
@@ -183,6 +184,8 @@ int main(void)
   MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
+  reverse_started = 0U;
+
   /* Load TIM1 timing values before starting. */
   if (HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
   {
@@ -236,7 +239,10 @@ int main(void)
     {
         encoder_report_tick = now;
 
+        // uint32_t count = __HAL_TIM_GET_COUNTER(&htim2);
+        uint32_t generator_stopped = (LL_TIM_IsEnabledCounter(TIM1) == 0U);
         uint32_t count = __HAL_TIM_GET_COUNTER(&htim2);
+
         char message[32];
 
         int length = snprintf(message, sizeof(message),
@@ -252,6 +258,35 @@ int main(void)
         {
             Error_Handler();
         }
+
+
+
+      /* Reverse once, after reporting the forward burst's final count. */
+      if ((reverse_started == 0U) && (generator_stopped != 0U))
+      {
+          uint32_t first_compare = LL_TIM_OC_GetCompareCH1(TIM1);
+
+          /* Swap the phase order: B now leads A. */
+          LL_TIM_OC_SetCompareCH1(TIM1, LL_TIM_OC_GetCompareCH3(TIM1));
+          LL_TIM_OC_SetCompareCH3(TIM1, first_compare);
+
+          /* Shorten only the reverse burst. */
+          LL_TIM_SetRepetitionCounter(TIM1, 299U);
+
+          /* Reload the repetition counter and reset TIM1 timing. */
+          if (HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
+          {
+              Error_Handler();
+          }
+          __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+
+          reverse_started = 1U;
+          LL_TIM_EnableCounter(TIM1);
+      }
+
+
+
+
     }
 
 
