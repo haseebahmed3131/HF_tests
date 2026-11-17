@@ -24,6 +24,7 @@
 
 #include "stm32u3xx_ll_tim.h"
 #include <stdio.h>
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -69,7 +70,6 @@ RTC_HandleTypeDef hrtc;
 
 SPI_HandleTypeDef hspi1;
 SPI_HandleTypeDef hspi2;
-SPI_HandleTypeDef hspi3;
 SPI_HandleTypeDef hspi4;
 
 TIM_HandleTypeDef htim1;
@@ -80,8 +80,10 @@ TIM_HandleTypeDef htim8;
 
 /* USER CODE BEGIN PV */
 
-static uint32_t encoder_report_tick;
-static uint8_t reverse_started;
+static volatile uint8_t lf_wakeup;
+static uint16_t lf_previous_count;
+static uint16_t lf_window_count;
+static uint32_t lf_total_count;
 
 /* USER CODE END PV */
 
@@ -100,7 +102,6 @@ static void MX_USART3_UART_Init(void);
 static void MX_OCTOSPI1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI2_Init(void);
-static void MX_SPI3_Init(void);
 static void MX_SPI4_Init(void);
 static void MX_LPTIM1_Init(void);
 static void MX_LPTIM3_Init(void);
@@ -122,6 +123,89 @@ static void MX_TIM8_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void LF_Print(const char *text)
+{
+    if (HAL_UART_Transmit(&huart1, (const uint8_t *)text,
+                          (uint16_t)strlen(text), 100U) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static uint16_t LF_ReadCount(void)
+{
+    uint32_t first;
+    uint32_t second;
+
+    /* Read until two consecutive asynchronous counter readings agree. */
+    do
+    {
+        first = HAL_LPTIM_ReadCounter(&hlptim1);
+        second = HAL_LPTIM_ReadCounter(&hlptim1);
+    } while (first != second);
+
+    return (uint16_t)second;
+}
+
+static void LF_StartBurst(uint16_t count)
+{
+    if (HAL_LPTIM_OnePulse_Stop(&hlptim3,
+                               LPTIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (count == 0U)
+    {
+        return;
+    }
+
+    /* The caller checks count <= 256. */
+    hlptim3.Init.RepetitionCounter = (uint32_t)count - 1U;
+
+    /* Reload timing and repetition while the output is stopped. */
+    if (HAL_LPTIM_Init(&hlptim3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_LPTIM_OnePulse_Start(&hlptim3,
+                                LPTIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void LF_EnterStop2(void)
+{
+    HAL_SuspendTick();
+
+    /* Prevent a wake-up interrupt being missed just before WFI. */
+    __disable_irq();
+    SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk;
+
+    if (lf_wakeup == 0U)
+    {
+        HAL_PWR_EnterSTOPMode(PWR_LOWPOWERMODE_STOP2,
+                              PWR_STOPENTRY_WFI);
+    }
+
+    __enable_irq();
+
+    SystemClock_Config();
+    HAL_ResumeTick();
+}
+
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *rtc)
+{
+    if (rtc->Instance == RTC)
+    {
+        lf_wakeup = 1U;
+    }
+}
+
+
 
 /* USER CODE END 0 */
 
@@ -166,7 +250,6 @@ int main(void)
   MX_OCTOSPI1_Init();
   MX_SPI1_Init();
   MX_SPI2_Init();
-  MX_SPI3_Init();
   MX_SPI4_Init();
   MX_LPTIM1_Init();
   MX_LPTIM3_Init();
@@ -184,44 +267,33 @@ int main(void)
   MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
-  reverse_started = 0U;
 
-  /* Load TIM1 timing values before starting. */
-  if (HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
+  if (HAL_RTCEx_DeactivateWakeUpTimer(&hrtc) != HAL_OK)
   {
       Error_Handler();
   }
 
-  /* Establish A = 0 and B = 0 before starting the encoder. */
-  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH1,
-                  LL_TIM_OCMODE_FORCED_INACTIVE);
-  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH3,
-                  LL_TIM_OCMODE_FORCED_INACTIVE);
-
-  LL_TIM_CC_EnableChannel(TIM1,
-                          LL_TIM_CHANNEL_CH1 | LL_TIM_CHANNEL_CH3);
-  LL_TIM_EnableAllOutputs(TIM1);
-
-  /* Restore toggle mode while the generator counter is stopped. */
-  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH1, LL_TIM_OCMODE_TOGGLE);
-  LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH3, LL_TIM_OCMODE_TOGGLE);
-
-  /* Start the receiver before generating the first edge. */
-  __HAL_TIM_SET_COUNTER(&htim2, 0U);
-
-  if (HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL) != HAL_OK)
+  if (HAL_LPTIM_Counter_Start(&hlptim1) != HAL_OK)
   {
       Error_Handler();
   }
 
-  // encoder_report_tick = HAL_GetTick();
-  // LL_TIM_EnableCounter(TIM1);
 
-  encoder_report_tick = HAL_GetTick();
+  lf_previous_count = LF_ReadCount();
+  lf_window_count = 0U;
+  lf_total_count = 0U;
+  lf_wakeup = 0U;
 
-  /* Stop the generator at the first repetition update event. */
-  LL_TIM_SetOnePulseMode(TIM1, LL_TIM_ONEPULSEMODE_SINGLE);
-  LL_TIM_EnableCounter(TIM1);
+  LF_Print("MCU sleep\r\n");
+
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 9U,
+          RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0U) != HAL_OK)
+  {
+      Error_Handler();
+  }
+  
+
+
 
   /* USER CODE END 2 */
 
@@ -233,62 +305,44 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-    uint32_t now = HAL_GetTick();
+    LF_EnterStop2();
 
-    if ((uint32_t)(now - encoder_report_tick) >= 250U)
+    if (lf_wakeup != 0U)
     {
-        encoder_report_tick = now;
+        lf_wakeup = 0U;
 
-        // uint32_t count = __HAL_TIM_GET_COUNTER(&htim2);
-        uint32_t generator_stopped = (LL_TIM_IsEnabledCounter(TIM1) == 0U);
-        uint32_t count = __HAL_TIM_GET_COUNTER(&htim2);
+        uint16_t current = LF_ReadCount();
 
-        char message[32];
+        lf_window_count = (uint16_t)(current - lf_previous_count);
+        lf_previous_count = current;
+        lf_total_count += lf_window_count;
+
+        char message[64];
 
         int length = snprintf(message, sizeof(message),
-                              "Count=%lu\r\n", (unsigned long)count);
+                              "MCU awake\r\nCount=%u Total=%lu\r\n",
+                              (unsigned int)lf_window_count,
+                              (unsigned long)lf_total_count);
 
         if ((length <= 0) || (length >= (int)sizeof(message)))
         {
             Error_Handler();
         }
 
-        if (HAL_UART_Transmit(&huart1, (uint8_t *)message,
-                              (uint16_t)length, 100U) != HAL_OK)
+        LF_Print(message);
+
+        if (lf_window_count <= 256U)
         {
-            Error_Handler();
+            LF_StartBurst(lf_window_count);
+        }
+        else
+        {
+            LF_Print("Replay skipped: count exceeds 256\r\n");
         }
 
-
-
-      /* Reverse once, after reporting the forward burst's final count. */
-      if ((reverse_started == 0U) && (generator_stopped != 0U))
-      {
-          uint32_t first_compare = LL_TIM_OC_GetCompareCH1(TIM1);
-
-          /* Swap the phase order: B now leads A. */
-          LL_TIM_OC_SetCompareCH1(TIM1, LL_TIM_OC_GetCompareCH3(TIM1));
-          LL_TIM_OC_SetCompareCH3(TIM1, first_compare);
-
-          /* Shorten only the reverse burst. */
-          LL_TIM_SetRepetitionCounter(TIM1, 299U);
-
-          /* Reload the repetition counter and reset TIM1 timing. */
-          if (HAL_TIM_GenerateEvent(&htim1, TIM_EVENTSOURCE_UPDATE) != HAL_OK)
-          {
-              Error_Handler();
-          }
-          __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
-
-          reverse_started = 1U;
-          LL_TIM_EnableCounter(TIM1);
-      }
-
-
-
-
+        LF_Print("MCU sleep\r\n");
     }
-
+    
 
   }
 
@@ -658,8 +712,6 @@ static void MX_LPTIM1_Init(void)
 
   /* USER CODE END LPTIM1_Init 0 */
 
-  LPTIM_IC_ConfigTypeDef sConfig = {0};
-
   /* USER CODE BEGIN LPTIM1_Init 1 */
 
   /* USER CODE END LPTIM1_Init 1 */
@@ -675,14 +727,6 @@ static void MX_LPTIM1_Init(void)
   hlptim1.Init.Input1Source = LPTIM_INPUT1SOURCE_GPIO;
   hlptim1.Init.RepetitionCounter = 0;
   if (HAL_LPTIM_Init(&hlptim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfig.ICInputSource = LPTIM_IC1SOURCE_GPIO;
-  sConfig.ICPrescaler = LPTIM_ICPSC_DIV1;
-  sConfig.ICPolarity = LPTIM_ICPOLARITY_RISING;
-  sConfig.ICFilter = LPTIM_ICFLT_CLOCK_DIV1;
-  if (HAL_LPTIM_IC_ConfigChannel(&hlptim1, &sConfig, LPTIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -750,37 +794,34 @@ static void MX_LPTIM3_Init(void)
 
   /* USER CODE END LPTIM3_Init 0 */
 
-  LPTIM_IC_ConfigTypeDef sConfig = {0};
+  LPTIM_OC_ConfigTypeDef sConfig1 = {0};
 
   /* USER CODE BEGIN LPTIM3_Init 1 */
 
   /* USER CODE END LPTIM3_Init 1 */
   hlptim3.Instance = LPTIM3;
   hlptim3.Init.Clock.Source = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC;
-  hlptim3.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV1;
-  hlptim3.Init.UltraLowPowerClock.Polarity = LPTIM_CLOCKPOLARITY_RISING;
-  hlptim3.Init.UltraLowPowerClock.SampleTime = LPTIM_CLOCKSAMPLETIME_DIRECTTRANSITION;
+  hlptim3.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV32;
   hlptim3.Init.Trigger.Source = LPTIM_TRIGSOURCE_SOFTWARE;
-  hlptim3.Init.Period = 65535;
-  hlptim3.Init.UpdateMode = LPTIM_UPDATE_IMMEDIATE;
-  hlptim3.Init.CounterSource = LPTIM_COUNTERSOURCE_EXTERNAL;
+  hlptim3.Init.Period = 31;
+  hlptim3.Init.UpdateMode = LPTIM_UPDATE_ENDOFPERIOD;
+  hlptim3.Init.CounterSource = LPTIM_COUNTERSOURCE_INTERNAL;
   hlptim3.Init.Input1Source = LPTIM_INPUT1SOURCE_GPIO;
   hlptim3.Init.RepetitionCounter = 0;
   if (HAL_LPTIM_Init(&hlptim3) != HAL_OK)
   {
     Error_Handler();
   }
-  sConfig.ICInputSource = LPTIM_IC1SOURCE_GPIO;
-  sConfig.ICPrescaler = LPTIM_ICPSC_DIV1;
-  sConfig.ICPolarity = LPTIM_ICPOLARITY_RISING;
-  sConfig.ICFilter = LPTIM_ICFLT_CLOCK_DIV1;
-  if (HAL_LPTIM_IC_ConfigChannel(&hlptim3, &sConfig, LPTIM_CHANNEL_1) != HAL_OK)
+  sConfig1.Pulse = 15;
+  sConfig1.OCPolarity = LPTIM_OCPOLARITY_HIGH;
+  if (HAL_LPTIM_OC_ConfigChannel(&hlptim3, &sConfig1, LPTIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN LPTIM3_Init 2 */
 
   /* USER CODE END LPTIM3_Init 2 */
+  HAL_LPTIM_MspPostInit(&hlptim3);
 
 }
 
@@ -1201,6 +1242,13 @@ static void MX_RTC_Init(void)
   {
     Error_Handler();
   }
+
+  /** Enable the WakeUp
+  */
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 9, RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
@@ -1322,63 +1370,6 @@ static void MX_SPI2_Init(void)
 }
 
 /**
-  * @brief SPI3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI3_Init(void)
-{
-
-  /* USER CODE BEGIN SPI3_Init 0 */
-
-  /* USER CODE END SPI3_Init 0 */
-
-  SPI_AutonomousModeConfTypeDef HAL_SPI_AutonomousMode_Cfg_Struct = {0};
-
-  /* USER CODE BEGIN SPI3_Init 1 */
-
-  /* USER CODE END SPI3_Init 1 */
-  /* SPI3 parameter configuration*/
-  hspi3.Instance = SPI3;
-  hspi3.Init.Mode = SPI_MODE_MASTER;
-  hspi3.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi3.Init.NSS = SPI_NSS_SOFT;
-  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi3.Init.CRCPolynomial = 0x7;
-  hspi3.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  hspi3.Init.NSSPolarity = SPI_NSS_POLARITY_LOW;
-  hspi3.Init.FifoThreshold = SPI_FIFO_THRESHOLD_01DATA;
-  hspi3.Init.MasterSSIdleness = SPI_MASTER_SS_IDLENESS_00CYCLE;
-  hspi3.Init.MasterInterDataIdleness = SPI_MASTER_INTERDATA_IDLENESS_00CYCLE;
-  hspi3.Init.MasterReceiverAutoSusp = SPI_MASTER_RX_AUTOSUSP_DISABLE;
-  hspi3.Init.MasterKeepIOState = SPI_MASTER_KEEP_IO_STATE_DISABLE;
-  hspi3.Init.IOSwap = SPI_IO_SWAP_DISABLE;
-  hspi3.Init.ReadyMasterManagement = SPI_RDY_MASTER_MANAGEMENT_INTERNALLY;
-  hspi3.Init.ReadyPolarity = SPI_RDY_POLARITY_HIGH;
-  if (HAL_SPI_Init(&hspi3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  HAL_SPI_AutonomousMode_Cfg_Struct.TriggerState = SPI_AUTO_MODE_DISABLE;
-  HAL_SPI_AutonomousMode_Cfg_Struct.TriggerSelection = SPI_GRP2_GPDMA_CH0_TCF_TRG;
-  HAL_SPI_AutonomousMode_Cfg_Struct.TriggerPolarity = SPI_TRIG_POLARITY_RISING;
-  if (HAL_SPIEx_SetConfigAutonomousMode(&hspi3, &HAL_SPI_AutonomousMode_Cfg_Struct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI3_Init 2 */
-
-  /* USER CODE END SPI3_Init 2 */
-
-}
-
-/**
   * @brief SPI4 Initialization Function
   * @param None
   * @retval None
@@ -1449,8 +1440,6 @@ static void MX_TIM1_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
   /* USER CODE BEGIN TIM1_Init 1 */
 
@@ -1471,47 +1460,10 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_OC_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.OCMode = TIM_OCMODE_TOGGLE;
-  sConfigOC.Pulse = 1250;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigOC.Pulse = 3750;
-  if (HAL_TIM_OC_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
-  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
-  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
-  sBreakDeadTimeConfig.DeadTime = 0;
-  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
-  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
-  sBreakDeadTimeConfig.BreakFilter = 0;
-  sBreakDeadTimeConfig.BreakAFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.Break2State = TIM_BREAK2_DISABLE;
-  sBreakDeadTimeConfig.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
-  sBreakDeadTimeConfig.Break2Filter = 0;
-  sBreakDeadTimeConfig.Break2AFMode = TIM_BREAK_AFMODE_INPUT;
-  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1522,7 +1474,6 @@ static void MX_TIM1_Init(void)
   // LL_TIM_OC_SetMode(TIM1, LL_TIM_CHANNEL_CH4, LL_TIM_OCMODE_PWM1);
 
   /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
 
 }
 
@@ -1550,7 +1501,7 @@ static void MX_TIM2_Init(void)
   htim2.Init.Period = 4294967295;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
   sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
   sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
   sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
