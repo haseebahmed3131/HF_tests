@@ -41,7 +41,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_hal_uart_ex.h \
  ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_hal_xspi.h \
  ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_ll_dlyb.h \
- ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_ll_tim.h
+ ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_ll_tim.h \
+ ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_hal_dma_ex.h
 ../Core/Inc/main.h:
 ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_hal.h:
 ../Core/Inc/stm32u3xx_hal_conf.h:
@@ -86,3 +87,4 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_hal_xspi.h:
 ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_ll_dlyb.h:
 ../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_ll_tim.h:
+../Drivers/STM32U3xx_HAL_Driver/Inc/stm32u3xx_hal_dma_ex.h:

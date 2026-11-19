@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 
 #include "stm32u3xx_ll_tim.h"
+#include "stm32u3xx_hal_dma_ex.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -36,6 +37,11 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define QUAD_MAX_STEPS 512U
+#define QUAD_A_PIN GPIO_PIN_5
+#define QUAD_B_PIN GPIO_PIN_3
+#define QUAD_PINS (QUAD_A_PIN | QUAD_B_PIN)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,13 +53,14 @@
 COMP_HandleTypeDef hcomp1;
 COMP_HandleTypeDef hcomp2;
 
+DMA_HandleTypeDef handle_GPDMA1_Channel0;
+
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 I2C_HandleTypeDef hi2c3;
 I2C_HandleTypeDef hi2c4;
 
 LPTIM_HandleTypeDef hlptim1;
-LPTIM_HandleTypeDef hlptim2;
 LPTIM_HandleTypeDef hlptim3;
 LPTIM_HandleTypeDef hlptim4;
 
@@ -82,14 +89,31 @@ TIM_HandleTypeDef htim8;
 
 static volatile uint8_t lf_wakeup;
 static uint16_t lf_previous_count;
-static uint16_t lf_window_count;
-static uint32_t lf_total_count;
+static int32_t lf_window_count;
+static int32_t lf_total_count;
+static int32_t lf_pending_edge;
+
+// static DMA_HandleTypeDef quad_dma;
+static DMA_QListTypeDef quad_queue;
+
+/* DMA nodes must remain inside one 64-Kbyte address window. */
+static DMA_NodeTypeDef quad_nodes[2U * QUAD_MAX_STEPS + 1U]
+    __attribute__((aligned(65536)));
+
+static uint32_t quad_words[QUAD_MAX_STEPS];
+static uint32_t quad_arr = 7U;
+static uint32_t quad_stop = 0U;
+static uint8_t quad_phase;
+
+_Static_assert(sizeof(quad_nodes) <= 65536U,
+               "DMA nodes exceed 64-Kbyte window");
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_GPDMA1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_I2C3_Init(void);
@@ -110,13 +134,12 @@ static void MX_ICACHE_Init(void);
 static void MX_RTC_Init(void);
 static void MX_COMP1_Init(void);
 static void MX_COMP2_Init(void);
-static void MX_LPTIM2_Init(void);
 static void MX_LPTIM4_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
 static void MX_TIM8_Init(void);
+static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -148,33 +171,220 @@ static uint16_t LF_ReadCount(void)
     return (uint16_t)second;
 }
 
-static void LF_StartBurst(uint16_t count)
+static void QUAD_Init(void)
 {
-    if (HAL_LPTIM_OnePulse_Stop(&hlptim3,
-                               LPTIM_CHANNEL_1) != HAL_OK)
+    GPIO_InitTypeDef gpio = {0};
+
+    if (hlptim3.Init.CounterSource != LPTIM_COUNTERSOURCE_INTERNAL ||
+        hlptim3.Init.Clock.Prescaler != LPTIM_PRESCALER_DIV32 ||
+        hlptim3.Init.Period != quad_arr ||
+        hlptim3.Init.RepetitionCounter != 0U)
+    {
+        LF_Print("Check LPTIM3: internal clock, DIV32, ARR=7, RCR=0\r\n");
+        Error_Handler();
+    }
+
+    __HAL_RCC_GPIOF_CLK_ENABLE();
+
+    /* Set the initial A/B state to 00. */
+    HAL_GPIO_WritePin(GPIOF, QUAD_PINS, GPIO_PIN_RESET);
+
+    gpio.Pin = QUAD_PINS;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOF, &gpio);
+
+    // __HAL_RCC_GPDMA1_CLK_ENABLE();
+    __HAL_RCC_GPDMA1_CLK_SLEEP_ENABLE();
+    __HAL_RCC_SRAM1_CLK_SLEEP_ENABLE();
+    __HAL_RCC_GPIOF_CLK_SLEEP_ENABLE();
+    __HAL_RCC_LPTIM1_CLK_SLEEP_ENABLE();
+    __HAL_RCC_LPTIM3_CLK_SLEEP_ENABLE();
+
+    // HAL_NVIC_DisableIRQ(GPDMA1_Channel0_IRQn);
+
+    quad_phase = 0U;
+
+}
+
+static void QUAD_AddNode(uint32_t index, uint32_t request,
+                         uint32_t *source,
+                         volatile uint32_t *destination)
+{
+    DMA_NodeConfTypeDef cfg = {0};
+
+    cfg.NodeType = DMA_GPDMA_LINEAR_NODE;
+    cfg.Init.Request = request;
+    cfg.Init.BlkHWRequest = (request == DMA_REQUEST_SW)
+                           ? DMA_BREQ_SINGLE_BURST : DMA_BREQ_BLOCK;
+    cfg.Init.Direction = (request == DMA_REQUEST_SW)
+                         ? DMA_MEMORY_TO_MEMORY : DMA_MEMORY_TO_PERIPH;
+    cfg.Init.SrcInc = DMA_SINC_FIXED;
+    cfg.Init.DestInc = DMA_DINC_FIXED;
+    cfg.Init.SrcDataWidth = DMA_SRC_DATAWIDTH_WORD;
+    cfg.Init.DestDataWidth = DMA_DEST_DATAWIDTH_WORD;
+    cfg.Init.SrcBurstLength = 1U;
+    cfg.Init.DestBurstLength = 1U;
+    cfg.Init.TransferAllocatedPort =
+        DMA_SRC_ALLOCATED_PORT1 | DMA_DEST_ALLOCATED_PORT0;
+    cfg.Init.TransferEventMode = DMA_TCEM_LAST_LL_ITEM_TRANSFER;
+    cfg.Init.Mode = DMA_NORMAL;
+
+    cfg.TriggerConfig.TriggerPolarity = DMA_TRIG_POLARITY_MASKED;
+    cfg.SrcAddress = (uint32_t)source;
+    cfg.DstAddress = (uint32_t)destination;
+    cfg.DataSize = sizeof(uint32_t);
+
+    if (HAL_DMAEx_List_BuildNode(&cfg, &quad_nodes[index]) != HAL_OK)
     {
         Error_Handler();
     }
 
-    if (count == 0U)
+    /* The local HAL node builder omits this field: apply BREQ explicitly. */
+    quad_nodes[index].LinkRegisters[NODE_CTR2_DEFAULT_OFFSET] |=
+        cfg.Init.BlkHWRequest;
+
+    if (HAL_DMAEx_List_InsertNode_Tail(&quad_queue,
+                                      &quad_nodes[index]) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void QUAD_FinishReplay(uint32_t steps)
+{
+    DMA_HandleTypeDef *dma = &handle_GPDMA1_Channel0;
+    uint32_t timeout_ms = steps * 8U + 50U;
+    HAL_StatusTypeDef status =
+        HAL_DMA_PollForTransfer(dma, HAL_DMA_FULL_TRANSFER, timeout_ms);
+    uint32_t error = HAL_DMA_GetError(dma);
+
+    if (status != HAL_OK || error != HAL_DMA_ERROR_NONE)
+    {
+        /* Channel 0 is the only configured GPDMA1 channel. */
+        if (HAL_DMA_GetState(dma) != HAL_DMA_STATE_READY)
+        {
+            __HAL_RCC_GPDMA1_FORCE_RESET();
+            __HAL_RCC_GPDMA1_RELEASE_RESET();
+            MX_GPDMA1_Init();
+        }
+
+        __HAL_RCC_LPTIM3_FORCE_RESET();
+        __HAL_RCC_LPTIM3_RELEASE_RESET();
+        MX_LPTIM3_Init();
+
+        HAL_GPIO_WritePin(GPIOF, QUAD_PINS, GPIO_PIN_RESET);
+        quad_phase = 0U;
+
+        char message[72];
+        snprintf(message, sizeof(message),
+                 "Output replay failed in Run mode (DMA ERR=%08lX)\r\n",
+                 (unsigned long)error);
+        LF_Print(message);
+    }
+
+    if (HAL_DMAEx_List_UnLinkQ(dma) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void QUAD_SetDMA(uint32_t requests)
+{
+    __HAL_LPTIM_CLEAR_FLAG(&hlptim3, LPTIM_FLAG_DIEROK);
+    WRITE_REG(LPTIM3->DIER, requests);
+
+    uint32_t started = HAL_GetTick();
+
+    while (__HAL_LPTIM_GET_FLAG(&hlptim3,
+                                LPTIM_FLAG_DIEROK) == RESET)
+    {
+        if ((uint32_t)(HAL_GetTick() - started) > 10U)
+        {
+            LF_Print("LPTIM3 DMA configuration timeout\r\n");
+            Error_Handler();
+        }
+    }
+}
+
+static void QUAD_Start(int32_t delta)
+{
+    static const uint32_t states[4] =
+        {0U, QUAD_A_PIN, QUAD_PINS, QUAD_B_PIN};
+
+    uint32_t steps = (delta < 0)
+                     ? (uint32_t)(-delta) : (uint32_t)delta;
+    uint8_t phase = quad_phase;
+    uint32_t index = 0U;
+
+    if (steps == 0U)
     {
         return;
     }
 
-    /* The caller checks count <= 256. */
-    hlptim3.Init.RepetitionCounter = (uint32_t)count - 1U;
+    if (steps > QUAD_MAX_STEPS)
+    {
+        LF_Print("Replay skipped: more than 512 counts\r\n");
+        return;
+    }
 
-    /* Reload timing and repetition while the output is stopped. */
-    if (HAL_LPTIM_Init(&hlptim3) != HAL_OK)
+    if (HAL_LPTIM_Counter_Stop(&hlptim3) != HAL_OK ||
+        HAL_DMAEx_List_ResetQ(&quad_queue) != HAL_OK)
     {
         Error_Handler();
     }
 
-    if (HAL_LPTIM_OnePulse_Start(&hlptim3,
-                                LPTIM_CHANNEL_1) != HAL_OK)
+    __HAL_LPTIM_ENABLE(&hlptim3);
+    QUAD_SetDMA(0U);
+
+    for (uint32_t i = 0U; i < steps; i++)
+    {
+        phase = (uint8_t)((phase +
+                         ((delta > 0) ? 1U : 3U)) & 3U);
+
+        uint32_t state = states[phase];
+
+        /* Update only the two quadrature GPIO pins. */
+        quad_words[i] = state |
+                        ((QUAD_PINS & ~state) << 16U);
+
+        /* Advance one quadrature state on a timer update. */
+        QUAD_AddNode(index++, GPDMA1_REQUEST_LPTIM3_UE,
+                     &quad_words[i], &GPIOF->BSRR);
+
+        /* Re-arm the next LPTIM update DMA request. */
+        QUAD_AddNode(index++, DMA_REQUEST_SW,
+                     &quad_arr, &LPTIM3->ARR);
+    }
+
+    /* Stop LPTIM3 after the final state without waking the CPU. */
+    QUAD_AddNode(index, DMA_REQUEST_SW,
+                 &quad_stop, &LPTIM3->CR);
+
+    if (HAL_DMAEx_List_LinkQ(&handle_GPDMA1_Channel0, &quad_queue) != HAL_OK)
     {
         Error_Handler();
     }
+
+    __HAL_LPTIM_CLEAR_FLAG(&hlptim3, LPTIM_FLAG_UPDATE);
+    __DSB();
+
+    if (HAL_DMAEx_List_Start(&handle_GPDMA1_Channel0) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+
+    QUAD_SetDMA(LPTIM_DMA_UPDATE);
+
+    if (HAL_LPTIM_Counter_Start(&hlptim3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    quad_phase = phase;
+    QUAD_FinishReplay(steps);
 }
 
 static void LF_EnterStop2(void)
@@ -238,6 +448,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_GPDMA1_Init();
   MX_I2C1_Init();
   MX_I2C2_Init();
   MX_I2C3_Init();
@@ -258,39 +469,42 @@ int main(void)
   MX_RTC_Init();
   MX_COMP1_Init();
   MX_COMP2_Init();
-  MX_LPTIM2_Init();
   MX_LPTIM4_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
-  MX_TIM4_Init();
   MX_TIM8_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
 
+if (HAL_RTCEx_DeactivateWakeUpTimer(&hrtc) != HAL_OK)
+{
+    Error_Handler();
+}
 
-  if (HAL_RTCEx_DeactivateWakeUpTimer(&hrtc) != HAL_OK)
-  {
-      Error_Handler();
-  }
+QUAD_Init();
 
-  if (HAL_LPTIM_Counter_Start(&hlptim1) != HAL_OK)
-  {
-      Error_Handler();
-  }
+if (HAL_LPTIM_Encoder_Start(&hlptim1) != HAL_OK)
+{
+    Error_Handler();
+}
 
+/* Allow the encoder inputs to synchronize before taking the baseline. */
+HAL_Delay(2U);
 
-  lf_previous_count = LF_ReadCount();
-  lf_window_count = 0U;
-  lf_total_count = 0U;
-  lf_wakeup = 0U;
+lf_previous_count = LF_ReadCount();
+lf_window_count = 0;
+lf_total_count = 0;
+lf_wakeup = 0U;
 
-  LF_Print("MCU sleep\r\n");
+if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 9U,
+        RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0U) != HAL_OK)
+{
+    Error_Handler();
+}
 
-  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 9U,
-          RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0U) != HAL_OK)
-  {
-      Error_Handler();
-  }
+LF_Print("MCU sleep\r\n");
+
   
 
 
@@ -312,35 +526,46 @@ int main(void)
         lf_wakeup = 0U;
 
         uint16_t current = LF_ReadCount();
+        uint16_t difference =
+            (uint16_t)(current - lf_previous_count);
 
-        lf_window_count = (uint16_t)(current - lf_previous_count);
         lf_previous_count = current;
+
+        /* Convert the wrapping hardware count into signed movement. */
+        lf_window_count = (difference < 32768U)
+                          ? (int32_t)difference
+                          : (int32_t)difference - 65536;
+
+        int32_t edge_delta = (difference < 32768U)
+                     ? (int32_t)difference
+                     : (int32_t)difference - 65536;
+
+        int32_t paired_edges = lf_pending_edge + edge_delta;
+        lf_window_count = paired_edges / 2;
+        lf_pending_edge = paired_edges % 2;
         lf_total_count += lf_window_count;
 
-        char message[64];
+        char message[80];
 
         int length = snprintf(message, sizeof(message),
-                              "MCU awake\r\nCount=%u Total=%lu\r\n",
-                              (unsigned int)lf_window_count,
-                              (unsigned long)lf_total_count);
+                              "MCU awake\r\nCount=%ld Total=%ld\r\n",
+                              (long)lf_window_count,
+                              (long)lf_total_count);
 
-        if ((length <= 0) || (length >= (int)sizeof(message)))
+        // char message[128];
+        // int length = snprintf(message, sizeof(message),
+        //                       "MCU awake\r\nRawEdges=%ld Pending=%ld Count=%ld Total=%ld\r\n",
+        //                       (long)edge_delta, (long)lf_pending_edge,
+        //                       (long)lf_window_count, (long)lf_total_count);
+
+        if (length <= 0 || length >= (int)sizeof(message))
         {
             Error_Handler();
         }
 
-        LF_Print(message);
-
-        if (lf_window_count <= 256U)
-        {
-            LF_StartBurst(lf_window_count);
-        }
-        else
-        {
-            LF_Print("Replay skipped: count exceeds 256\r\n");
-        }
-
-        LF_Print("MCU sleep\r\n");
+      LF_Print(message);
+      QUAD_Start(lf_window_count * 4);
+      LF_Print("MCU sleep\r\n");
     }
     
 
@@ -473,6 +698,44 @@ static void MX_COMP2_Init(void)
   /* USER CODE BEGIN COMP2_Init 2 */
 
   /* USER CODE END COMP2_Init 2 */
+
+}
+
+/**
+  * @brief GPDMA1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPDMA1_Init(void)
+{
+
+  /* USER CODE BEGIN GPDMA1_Init 0 */
+
+  /* USER CODE END GPDMA1_Init 0 */
+
+  /* Peripheral clock enable */
+  __HAL_RCC_GPDMA1_CLK_ENABLE();
+
+  /* USER CODE BEGIN GPDMA1_Init 1 */
+
+  /* USER CODE END GPDMA1_Init 1 */
+  handle_GPDMA1_Channel0.Instance = GPDMA1_Channel0;
+  handle_GPDMA1_Channel0.InitLinkedList.Priority = DMA_HIGH_PRIORITY;
+  handle_GPDMA1_Channel0.InitLinkedList.LinkStepMode = DMA_LSM_FULL_EXECUTION;
+  handle_GPDMA1_Channel0.InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT1;
+  handle_GPDMA1_Channel0.InitLinkedList.TransferEventMode = DMA_TCEM_LAST_LL_ITEM_TRANSFER;
+  handle_GPDMA1_Channel0.InitLinkedList.LinkedListMode = DMA_LINKEDLIST_NORMAL;
+  if (HAL_DMAEx_List_Init(&handle_GPDMA1_Channel0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DMA_ConfigChannelAttributes(&handle_GPDMA1_Channel0, DMA_CHANNEL_NPRIV) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN GPDMA1_Init 2 */
+
+  /* USER CODE END GPDMA1_Init 2 */
 
 }
 
@@ -719,7 +982,7 @@ static void MX_LPTIM1_Init(void)
   hlptim1.Init.Clock.Source = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC;
   hlptim1.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV1;
   hlptim1.Init.UltraLowPowerClock.Polarity = LPTIM_CLOCKPOLARITY_RISING;
-  hlptim1.Init.UltraLowPowerClock.SampleTime = LPTIM_CLOCKSAMPLETIME_DIRECTTRANSITION;
+  hlptim1.Init.UltraLowPowerClock.SampleTime = LPTIM_CLOCKSAMPLETIME_8TRANSITIONS;
   hlptim1.Init.Trigger.Source = LPTIM_TRIGSOURCE_SOFTWARE;
   hlptim1.Init.Period = 65535;
   hlptim1.Init.UpdateMode = LPTIM_UPDATE_IMMEDIATE;
@@ -737,52 +1000,6 @@ static void MX_LPTIM1_Init(void)
 }
 
 /**
-  * @brief LPTIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_LPTIM2_Init(void)
-{
-
-  /* USER CODE BEGIN LPTIM2_Init 0 */
-
-  /* USER CODE END LPTIM2_Init 0 */
-
-  LPTIM_IC_ConfigTypeDef sConfig = {0};
-
-  /* USER CODE BEGIN LPTIM2_Init 1 */
-
-  /* USER CODE END LPTIM2_Init 1 */
-  hlptim2.Instance = LPTIM2;
-  hlptim2.Init.Clock.Source = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC;
-  hlptim2.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV1;
-  hlptim2.Init.UltraLowPowerClock.Polarity = LPTIM_CLOCKPOLARITY_RISING;
-  hlptim2.Init.UltraLowPowerClock.SampleTime = LPTIM_CLOCKSAMPLETIME_DIRECTTRANSITION;
-  hlptim2.Init.Trigger.Source = LPTIM_TRIGSOURCE_SOFTWARE;
-  hlptim2.Init.Period = 65535;
-  hlptim2.Init.UpdateMode = LPTIM_UPDATE_IMMEDIATE;
-  hlptim2.Init.CounterSource = LPTIM_COUNTERSOURCE_EXTERNAL;
-  hlptim2.Init.Input1Source = LPTIM_INPUT1SOURCE_GPIO;
-  hlptim2.Init.RepetitionCounter = 0;
-  if (HAL_LPTIM_Init(&hlptim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfig.ICInputSource = LPTIM_IC1SOURCE_GPIO;
-  sConfig.ICPrescaler = LPTIM_ICPSC_DIV1;
-  sConfig.ICPolarity = LPTIM_ICPOLARITY_RISING;
-  sConfig.ICFilter = LPTIM_ICFLT_CLOCK_DIV1;
-  if (HAL_LPTIM_IC_ConfigChannel(&hlptim2, &sConfig, LPTIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN LPTIM2_Init 2 */
-
-  /* USER CODE END LPTIM2_Init 2 */
-
-}
-
-/**
   * @brief LPTIM3 Initialization Function
   * @param None
   * @retval None
@@ -794,8 +1011,6 @@ static void MX_LPTIM3_Init(void)
 
   /* USER CODE END LPTIM3_Init 0 */
 
-  LPTIM_OC_ConfigTypeDef sConfig1 = {0};
-
   /* USER CODE BEGIN LPTIM3_Init 1 */
 
   /* USER CODE END LPTIM3_Init 1 */
@@ -803,7 +1018,7 @@ static void MX_LPTIM3_Init(void)
   hlptim3.Init.Clock.Source = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC;
   hlptim3.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV32;
   hlptim3.Init.Trigger.Source = LPTIM_TRIGSOURCE_SOFTWARE;
-  hlptim3.Init.Period = 31;
+  hlptim3.Init.Period = 7;
   hlptim3.Init.UpdateMode = LPTIM_UPDATE_ENDOFPERIOD;
   hlptim3.Init.CounterSource = LPTIM_COUNTERSOURCE_INTERNAL;
   hlptim3.Init.Input1Source = LPTIM_INPUT1SOURCE_GPIO;
@@ -812,16 +1027,9 @@ static void MX_LPTIM3_Init(void)
   {
     Error_Handler();
   }
-  sConfig1.Pulse = 15;
-  sConfig1.OCPolarity = LPTIM_OCPOLARITY_HIGH;
-  if (HAL_LPTIM_OC_ConfigChannel(&hlptim3, &sConfig1, LPTIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
   /* USER CODE BEGIN LPTIM3_Init 2 */
 
   /* USER CODE END LPTIM3_Init 2 */
-  HAL_LPTIM_MspPostInit(&hlptim3);
 
 }
 
@@ -1721,41 +1929,51 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
-  /*Configure GPIO pins : USM_COM_IRQ_EXTI13_Pin DIGITAL_INPUT2_IRQ_EXTI7_Pin OPTICAL_HEAD_IR_DETECT_IRQ_EXTI9_Pin */
-  GPIO_InitStruct.Pin = USM_COM_IRQ_EXTI13_Pin|DIGITAL_INPUT2_IRQ_EXTI7_Pin|OPTICAL_HEAD_IR_DETECT_IRQ_EXTI9_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_3|GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : PC13 PC7 PC9 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_7|GPIO_PIN_9;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : EXTERNAL_RTC_ETXI2_Pin */
-  GPIO_InitStruct.Pin = EXTERNAL_RTC_ETXI2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  /*Configure GPIO pin : PF2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(EXTERNAL_RTC_ETXI2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : KEY_DOWN_BUTTON_EXTI6_Pin DIGITAL_INPUT4_IRQ_EXTI11_Pin DIGITAL_INPUT3_IRQ_EXTI12_Pin */
-  GPIO_InitStruct.Pin = KEY_DOWN_BUTTON_EXTI6_Pin|DIGITAL_INPUT4_IRQ_EXTI11_Pin|DIGITAL_INPUT3_IRQ_EXTI12_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  /*Configure GPIO pins : PF3 PF5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PA6 PA11 PA12 */
+  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_11|GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DIGITAL_INPUT1_IRQ_EXTI10_Pin KEY_LEFT_BUTTON_EXTI1_Pin KEY_UP_BUTTON_EXT14_Pin */
-  GPIO_InitStruct.Pin = DIGITAL_INPUT1_IRQ_EXTI10_Pin|KEY_LEFT_BUTTON_EXTI1_Pin|KEY_UP_BUTTON_EXT14_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  /*Configure GPIO pins : PD10 PD1 PD4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_1|GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : KEY_ESCAPE_BUTTON_IRQ_EXTI3_Pin BATTERY_FUEL_GUAGE_IRQ_ETXI15_Pin KEY_ENTER_BUTTON_IRQ_EXTI8_Pin */
-  GPIO_InitStruct.Pin = KEY_ESCAPE_BUTTON_IRQ_EXTI3_Pin|BATTERY_FUEL_GUAGE_IRQ_ETXI15_Pin|KEY_ENTER_BUTTON_IRQ_EXTI8_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  /*Configure GPIO pins : PG3 PG5 PG8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_5|GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : KEY_RIGHT_BUTTON_EXTI0_Pin */
-  GPIO_InitStruct.Pin = KEY_RIGHT_BUTTON_EXTI0_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  /*Configure GPIO pin : PE0 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0;
+  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(KEY_RIGHT_BUTTON_EXTI0_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
