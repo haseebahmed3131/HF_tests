@@ -61,6 +61,7 @@ I2C_HandleTypeDef hi2c3;
 I2C_HandleTypeDef hi2c4;
 
 LPTIM_HandleTypeDef hlptim1;
+LPTIM_HandleTypeDef hlptim2;
 LPTIM_HandleTypeDef hlptim3;
 LPTIM_HandleTypeDef hlptim4;
 
@@ -88,10 +89,28 @@ TIM_HandleTypeDef htim8;
 /* USER CODE BEGIN PV */
 
 static volatile uint8_t lf_wakeup;
-static uint16_t lf_previous_count;
-static int32_t lf_window_count;
-static int32_t lf_total_count;
-static int32_t lf_pending_edge;
+enum {
+    LF_TICK_HZ = 1024U,
+    LF_MIN_HIGH_TICKS = (40U * LF_TICK_HZ) / 1000U,
+    LF_MIN_LOW_TICKS = (60U * LF_TICK_HZ) / 1000U,
+    LF_REPORT_SECONDS = 30U
+};
+
+typedef struct {
+    uint32_t edges;
+    uint32_t valid;
+    uint32_t noise;
+    uint32_t early;
+    uint32_t lost;
+    uint32_t periods;
+    uint32_t period_ticks;
+    uint32_t irq_entries;
+} LF_Window;
+
+
+static volatile LF_Window lf_window;
+static uint16_t lf_rise, lf_fall, lf_previous_rise;
+static uint8_t lf_have_rise, lf_have_fall, lf_have_previous_rise;
 
 // static DMA_HandleTypeDef quad_dma;
 static DMA_QListTypeDef quad_queue;
@@ -140,6 +159,7 @@ static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM8_Init(void);
 static void MX_TIM4_Init(void);
+static void MX_LPTIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -156,19 +176,152 @@ static void LF_Print(const char *text)
     }
 }
 
-static uint16_t LF_ReadCount(void)
+static void LF_StartCapture(void)
 {
-    uint32_t first;
-    uint32_t second;
+    __HAL_RCC_GPIOA_CLK_SLEEP_ENABLE();
+    __HAL_RCC_LPTIM2_CLK_SLEEP_ENABLE();
 
-    /* Read until two consecutive asynchronous counter readings agree. */
-    do
+    __HAL_RCC_GPIOA_CLK_STOP_ENABLE();
+    __HAL_RCC_LPTIM2_CLK_STOP_ENABLE();
+
+    if (HAL_LPTIM_IC_Start_IT(&hlptim2, LPTIM_CHANNEL_1) != HAL_OK)
     {
-        first = HAL_LPTIM_ReadCounter(&hlptim1);
-        second = HAL_LPTIM_ReadCounter(&hlptim1);
-    } while (first != second);
+        Error_Handler();
+    }
+}
 
-    return (uint16_t)second;
+static void LF_ResetPairing(void)
+{
+    lf_have_rise = 0U;
+    lf_have_fall = 0U;
+    lf_have_previous_rise = 0U;
+}
+
+static void LF_RecordEdge(uint16_t stamp, uint8_t high_level)
+{
+    ++lf_window.edges;
+
+    if (high_level != 0U)
+    {
+        if (lf_have_rise != 0U)
+        {
+            ++lf_window.lost;
+            LF_ResetPairing();
+        }
+
+        lf_rise = stamp;
+        lf_have_rise = 1U;
+        return;
+    }
+
+    if (lf_have_rise != 0U)
+    {
+        uint16_t high = (uint16_t)(stamp - lf_rise);
+        uint16_t low = (uint16_t)(lf_rise - lf_fall);
+        uint8_t short_pulse = (high < LF_MIN_HIGH_TICKS);
+        uint8_t early_pulse = (lf_have_fall != 0U && low < LF_MIN_LOW_TICKS);
+
+        lf_window.noise += short_pulse;
+        lf_window.early += early_pulse;
+
+        if (short_pulse == 0U && early_pulse == 0U)
+        {
+            ++lf_window.valid;
+            if (lf_have_previous_rise != 0U)
+            {
+                lf_window.period_ticks += (uint16_t)(lf_rise - lf_previous_rise);
+                ++lf_window.periods;
+            }
+            lf_previous_rise = lf_rise;
+            lf_have_previous_rise = 1U;
+        }
+        else
+        {
+            lf_have_previous_rise = 0U;
+        }
+    }
+    else if (lf_have_fall != 0U)
+    {
+        ++lf_window.lost;
+        LF_ResetPairing();
+    }
+
+    lf_have_rise = 0U;
+    lf_fall = stamp;
+    lf_have_fall = 1U;
+}
+
+void LF_HandleCaptureIRQ(void)
+{
+    ++lf_window.irq_entries;
+    uint32_t flags = LPTIM2->ISR;
+    if ((flags & LPTIM_FLAG_CC1) == 0U)
+    {
+        return;
+    }
+
+    uint16_t stamp = (uint16_t)LPTIM2->CCR1;
+    uint8_t high_level = ((GPIOA->IDR & GPIO_PIN_8) != 0U);
+    uint32_t after = LPTIM2->ISR;
+
+    if (((flags | after) & LPTIM_FLAG_CC1O) != 0U ||
+        (after & LPTIM_FLAG_CC1) != 0U)
+    {
+        LPTIM2->ICR = LPTIM_FLAG_CC1O;
+        ++lf_window.lost;
+        LF_ResetPairing();
+        return;
+    }
+
+    LF_RecordEdge(stamp, high_level);
+}
+
+static void LF_Report(void)
+{
+    __disable_irq();
+    LF_Window window = lf_window;
+    lf_window = (LF_Window){0};
+    lf_wakeup = 0U;
+
+    if (window.edges == 0U)
+    {
+        LF_ResetPairing();
+    }
+    __enable_irq();
+
+    if (window.edges == 0U && window.lost == 0U)
+    {
+        LF_Print("LF_FAULT: NO_EDGES\r\n");
+    }
+
+    uint32_t millihz = window.period_ticks == 0U ? 0U :
+        (1000U * LF_TICK_HZ * window.periods + window.period_ticks / 2U) /
+        window.period_ticks;
+    char message[120];
+
+    snprintf(message, sizeof(message),
+            //  "LF Valid=%lu Noise=%lu EARLY_PULSE=%lu CAPTURE_LOSS=%lu Freq=%lu.%03lu Hz\r\n",
+             "30 sec passed | LF Valid=%lu Noise=%lu EARLY_PULSE=%lu "
+            "CAPTURE_LOSS=%lu Freq=%lu.%03lu Hz\r\n",
+             (unsigned long)window.valid, (unsigned long)window.noise,
+             (unsigned long)window.early, (unsigned long)window.lost,
+             (unsigned long)(millihz / 1000U), (unsigned long)(millihz % 1000U));
+
+    LF_Print(message);
+
+    static uint16_t previous_cnt;
+    uint16_t cnt = (uint16_t)LPTIM2->CNT;
+    uint16_t delta = (uint16_t)(cnt - previous_cnt);
+    previous_cnt = cnt;
+
+    snprintf(message, sizeof(message),
+            "LF debug: IRQ=%lu Edges=%lu CNTdelta=%u CC1E=%u CC1IE=%u\r\n",
+            (unsigned long)window.irq_entries, (unsigned long)window.edges,
+            (unsigned)delta,
+            (unsigned)((LPTIM2->CCMR1 & LPTIM_CCMR1_CC1E) != 0U),
+            (unsigned)((LPTIM2->DIER & LPTIM_DIER_CC1IE) != 0U));
+    // LF_Print(message);
+    LF_Print(message);
 }
 
 static void QUAD_Init(void)
@@ -387,23 +540,19 @@ static void QUAD_Start(int32_t delta)
     QUAD_FinishReplay(steps);
 }
 
-static void LF_EnterStop2(void)
+static void LF_EnterStop1(void)
 {
     HAL_SuspendTick();
-
-    /* Prevent a wake-up interrupt being missed just before WFI. */
     __disable_irq();
     SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk;
 
     if (lf_wakeup == 0U)
     {
-        HAL_PWR_EnterSTOPMode(PWR_LOWPOWERMODE_STOP2,
-                              PWR_STOPENTRY_WFI);
+        __DSB();
+        HAL_PWR_EnterSTOPMode(PWR_LOWPOWERMODE_STOP1, PWR_STOPENTRY_WFI);
     }
 
     __enable_irq();
-
-    SystemClock_Config();
     HAL_ResumeTick();
 }
 
@@ -475,35 +624,28 @@ int main(void)
   MX_TIM3_Init();
   MX_TIM8_Init();
   MX_TIM4_Init();
+  MX_LPTIM2_Init();
   /* USER CODE BEGIN 2 */
 
-if (HAL_RTCEx_DeactivateWakeUpTimer(&hrtc) != HAL_OK)
-{
-    Error_Handler();
-}
+  const uint32_t capture_configured_ms = HAL_GetTick();
+  uint8_t capture_started = 0U;
 
-QUAD_Init();
+  if (HAL_RTCEx_DeactivateWakeUpTimer(&hrtc) != HAL_OK)
+  {
+      Error_Handler();
+  }
 
-if (HAL_LPTIM_Encoder_Start(&hlptim1) != HAL_OK)
-{
-    Error_Handler();
-}
+  HAL_RCCEx_StopWakeupSysclkConfig(RCC_STOP_WKUP_SYSCLK_MSIS);
+  // LF_StartCapture();
+  lf_wakeup = 0U;
 
-/* Allow the encoder inputs to synchronize before taking the baseline. */
-HAL_Delay(2U);
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, LF_REPORT_SECONDS - 1U,
+          RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0U) != HAL_OK)
+  {
+      Error_Handler();
+  }
 
-lf_previous_count = LF_ReadCount();
-lf_window_count = 0;
-lf_total_count = 0;
-lf_wakeup = 0U;
-
-if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 9U,
-        RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0U) != HAL_OK)
-{
-    Error_Handler();
-}
-
-LF_Print("MCU sleep\r\n");
+  // LF_Print("LF interrupt capture armed\r\n");
 
   
 
@@ -519,59 +661,30 @@ LF_Print("MCU sleep\r\n");
 
     /* USER CODE BEGIN 3 */
 
-    LF_EnterStop2();
+    if (capture_started == 0U)
+    {
+        if ((HAL_GetTick() - capture_configured_ms) < 4U)
+        {
+            HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+            continue;
+        }
+
+        LF_StartCapture();
+        capture_started = 1U;
+        LF_Print("LF interrupt capture armed\r\n");
+    }
+
+    // LF_EnterStop1();
+    // HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    LF_EnterStop1();
 
     if (lf_wakeup != 0U)
     {
-        lf_wakeup = 0U;
-
-        uint16_t current = LF_ReadCount();
-        uint16_t difference =
-            (uint16_t)(current - lf_previous_count);
-
-        lf_previous_count = current;
-
-        /* Convert the wrapping hardware count into signed movement. */
-        lf_window_count = (difference < 32768U)
-                          ? (int32_t)difference
-                          : (int32_t)difference - 65536;
-
-        int32_t edge_delta = (difference < 32768U)
-                     ? (int32_t)difference
-                     : (int32_t)difference - 65536;
-
-        int32_t paired_edges = lf_pending_edge + edge_delta;
-        lf_window_count = paired_edges / 2;
-        lf_pending_edge = paired_edges % 2;
-        lf_total_count += lf_window_count;
-
-        char message[80];
-
-        int length = snprintf(message, sizeof(message),
-                              "MCU awake\r\nCount=%ld Total=%ld\r\n",
-                              (long)lf_window_count,
-                              (long)lf_total_count);
-
-        // char message[128];
-        // int length = snprintf(message, sizeof(message),
-        //                       "MCU awake\r\nRawEdges=%ld Pending=%ld Count=%ld Total=%ld\r\n",
-        //                       (long)edge_delta, (long)lf_pending_edge,
-        //                       (long)lf_window_count, (long)lf_total_count);
-
-        if (length <= 0 || length >= (int)sizeof(message))
-        {
-            Error_Handler();
-        }
-
-      LF_Print(message);
-      QUAD_Start(lf_window_count * 4);
-      LF_Print("MCU sleep\r\n");
+        LF_Report();
     }
-    
 
+    /* USER CODE END 3 */
   }
-
-  /* USER CODE END 3 */
 }
 
 /**
@@ -996,6 +1109,50 @@ static void MX_LPTIM1_Init(void)
   /* USER CODE BEGIN LPTIM1_Init 2 */
 
   /* USER CODE END LPTIM1_Init 2 */
+
+}
+
+/**
+  * @brief LPTIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_LPTIM2_Init(void)
+{
+
+  /* USER CODE BEGIN LPTIM2_Init 0 */
+
+  /* USER CODE END LPTIM2_Init 0 */
+
+  LPTIM_IC_ConfigTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN LPTIM2_Init 1 */
+
+  /* USER CODE END LPTIM2_Init 1 */
+  hlptim2.Instance = LPTIM2;
+  hlptim2.Init.Clock.Source = LPTIM_CLOCKSOURCE_APBCLOCK_LPOSC;
+  hlptim2.Init.Clock.Prescaler = LPTIM_PRESCALER_DIV32;
+  hlptim2.Init.Trigger.Source = LPTIM_TRIGSOURCE_SOFTWARE;
+  hlptim2.Init.Period = 65535;
+  hlptim2.Init.UpdateMode = LPTIM_UPDATE_IMMEDIATE;
+  hlptim2.Init.CounterSource = LPTIM_COUNTERSOURCE_INTERNAL;
+  hlptim2.Init.Input1Source = LPTIM_INPUT1SOURCE_GPIO;
+  hlptim2.Init.RepetitionCounter = 0;
+  if (HAL_LPTIM_Init(&hlptim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfig.ICInputSource = LPTIM_IC1SOURCE_GPIO;
+  sConfig.ICPrescaler = LPTIM_ICPSC_DIV1;
+  sConfig.ICPolarity = LPTIM_ICPOLARITY_RISING_FALLING;
+  sConfig.ICFilter = LPTIM_ICFLT_CLOCK_DIV1;
+  if (HAL_LPTIM_IC_ConfigChannel(&hlptim2, &sConfig, LPTIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN LPTIM2_Init 2 */
+
+  /* USER CODE END LPTIM2_Init 2 */
 
 }
 
@@ -1453,7 +1610,7 @@ static void MX_RTC_Init(void)
 
   /** Enable the WakeUp
   */
-  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 9, RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0) != HAL_OK)
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 29, RTC_WAKEUPCLOCK_CK_SPRE_16BITS, 0) != HAL_OK)
   {
     Error_Handler();
   }

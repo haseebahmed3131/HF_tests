@@ -487,6 +487,42 @@ void HAL_LPTIM_MspInit(LPTIM_HandleTypeDef* hlptim)
 
     /* USER CODE END LPTIM1_MspInit 1 */
   }
+  else if(hlptim->Instance==LPTIM2)
+  {
+    /* USER CODE BEGIN LPTIM2_MspInit 0 */
+
+    /* USER CODE END LPTIM2_MspInit 0 */
+
+  /** Initializes the peripherals clock
+  */
+    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_LPTIM2;
+    PeriphClkInit.Lptim2ClockSelection = RCC_LPTIM2CLKSOURCE_LSE;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* Peripheral clock enable */
+    __HAL_RCC_LPTIM2_CLK_ENABLE();
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    /**LPTIM2 GPIO Configuration
+    PA8     ------> LPTIM2_CH1
+    */
+    GPIO_InitStruct.Pin = GPIO_PIN_8;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF14_LPTIM2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* LPTIM2 interrupt Init */
+    HAL_NVIC_SetPriority(LPTIM2_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(LPTIM2_IRQn);
+    /* USER CODE BEGIN LPTIM2_MspInit 1 */
+
+    /* USER CODE END LPTIM2_MspInit 1 */
+  }
   else if(hlptim->Instance==LPTIM3)
   {
     /* USER CODE BEGIN LPTIM3_MspInit 0 */
@@ -571,6 +607,25 @@ void HAL_LPTIM_MspDeInit(LPTIM_HandleTypeDef* hlptim)
     /* USER CODE BEGIN LPTIM1_MspDeInit 1 */
 
     /* USER CODE END LPTIM1_MspDeInit 1 */
+  }
+  else if(hlptim->Instance==LPTIM2)
+  {
+    /* USER CODE BEGIN LPTIM2_MspDeInit 0 */
+
+    /* USER CODE END LPTIM2_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_LPTIM2_CLK_DISABLE();
+
+    /**LPTIM2 GPIO Configuration
+    PA8     ------> LPTIM2_CH1
+    */
+    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_8);
+
+    /* LPTIM2 interrupt DeInit */
+    HAL_NVIC_DisableIRQ(LPTIM2_IRQn);
+    /* USER CODE BEGIN LPTIM2_MspDeInit 1 */
+
+    /* USER CODE END LPTIM2_MspDeInit 1 */
   }
   else if(hlptim->Instance==LPTIM3)
   {
